@@ -4,9 +4,28 @@ export RXTOPIC=Bticino/rx
 export DUMPTOPIC=Bticino/tx
 export TOPICSRD=Bticino/start_date
 export LASTWILLTOPIC=Bticino/LastWillT
+export HBTOPIC=Bticino/heartbeat
+export HBFILE=/tmp/mqtt_tx_alive     # touched by StartMqttSend each time its heartbeat gets out
 export GATEWAYADDR=192.168.1.1
 
-while : 
+kill_match() {   # kill -9 every process whose command line contains both words
+  PID="$(ps -edf | grep "$1" | grep "$2" | grep -v grep | awk '{print $2}')"
+  if [ -n "${PID}" ]; then
+    /bin/kill -9 $PID > /dev/null 2>&1
+  fi
+}
+kill_send() {
+  kill_match sh StartMqttSend
+  kill_match mosquitto_pub $DUMPTOPIC
+  kill_match python3 filter.py
+  kill_match tcpdump 30006
+}
+kill_receive() {
+  kill_match sh StartMqttReceive
+  kill_match mosquitto_sub $RXTOPIC
+}
+
+while :
   do
     PING=`ping -s 1 -c 4 ${GATEWAYADDR} > /dev/null; echo $?`
     FILE=/tmp/flexisip_restarted
@@ -15,45 +34,31 @@ while :
 
       # Network is down or flexisip restarted
 
-      if [ -f "$FILE" ]; then
-        /bin/rm "$FILE"
-      fi
-      PID="$(ps -edf | grep sh | grep StartMqttSend | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID > /dev/null
-      fi
-      PID="$(ps -edf | grep mosquitto_pub | grep $DUMPTOPIC | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID
-      fi
-      PID="$(ps -edf | grep python3 | grep filter.py | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID > /dev/null
-      fi
-      PID="$(ps -edf | grep tcpdump | grep 30006 | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID > /dev/null
-      fi
-      PID="$(ps -edf | grep sh | grep StartMqttReceive | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID > /dev/null
-      fi
-      PID="$(ps -edf | grep mosquitto_sub | grep $RXTOPIC | awk '{print $2}')"
-      if [ -n "${PID}" ]; then
-        /bin/kill -9 $PID > /dev/null
-      fi
+      /bin/rm -f "$FILE"
+      kill_send
+      kill_receive
     else
-      # Network is up
-      if ! /usr/bin/pgrep -x tcpdump > /dev/null ; then
+      # Network is up.
+      # The send path is healthy only while its own heartbeat keeps getting out (it tries once
+      # a minute). A missing piece, or a loop that stopped getting through for 5 minutes,
+      # restarts the whole pipe -- whatever the cause, including ones not seen yet.
+      if ! /usr/bin/pgrep -x tcpdump > /dev/null \
+         || ! /usr/bin/pgrep -f /etc/StartMqttSend > /dev/null \
+         || [ -z "$(/usr/bin/find "$HBFILE" -mmin -5 2>/dev/null)" ]; then
+        kill_send
+        /bin/touch "$HBFILE"          # a fresh pipe gets 5 minutes to send its first heartbeat
         /etc/StartMqttSend &
         /bin/sleep 5
         /bin/date | /usr/bin/mosquitto_pub -l -r -h ${BROKERADDR} -t ${TOPICSRD}
         /bin/sleep 5
       fi
-      if ! /usr/bin/pgrep -x mosquitto_sub > /dev/null ; then
+      # The script, not mosquitto_sub: that one exits after every command and is briefly
+      # absent, and catching it then used to start a SECOND receive loop (commands run twice).
+      if ! /usr/bin/pgrep -f /etc/StartMqttReceive > /dev/null ; then
+        kill_receive
         /etc/StartMqttReceive &
         /bin/sleep 5
-        /usr/bin/mosquitto_pub -r -h ${BROKERADDR} -t ${LASTWILLTOPIC} -m online    
+        /usr/bin/mosquitto_pub -r -h ${BROKERADDR} -t ${LASTWILLTOPIC} -m online
       fi
     fi
     /bin/sleep 1m

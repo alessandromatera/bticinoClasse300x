@@ -12,8 +12,9 @@ This script is only used to launch the main TcpDump2Mqtt script in background mo
 
 ## TcpDump2Mqtt
 
-This is the main script that checks every 10 minutes:
+This is the main script that checks every minute:
 * that the script for publishing and receiving commands are active and alternatively executes them.
+* that the publishing script is still getting its heartbeat out to the broker (see **HBTOPIC**). If it has not for 5 minutes, the whole publishing pipe is killed and started again — whatever made it stop, even while its processes still look alive.
 * if the gateway to which the video door entry unit is connected (parameter GATEWAYADDR = 192.168.1.1) can be reached. The management of the polling to the gateway has been implemented because if the connection with the Wifi is lost, the ** StartMqttSend ** and ** StartMqttReceive ** scripts would no longer work. If the gateway is not reachable, the currently active scripts are killed and then run again when the connection is restored. In my specific case, I turn off the WiFi in the evening to reactivate it in the morning, and thus I have solved in this way the problem of blocking the scripts on disconnection.
 
 The configuration parameters for the script operation are at the top of the file and are the following:
@@ -28,12 +29,18 @@ The configuration parameters for the script operation are at the top of the file
    MQTT topic which is updated with the date and time of activation of the script
 * **LASTWILLTOPIC** = Bticino / LastWillT
    MQTT topic set to online / offline in case of connection / disconnection of the video door entry unit from the WiFi network.
+* **HBTOPIC** = Bticino / heartbeat
+   Retained MQTT topic updated once a minute with the unit's time (seconds since 1970) by the publishing script. A home automation system can alarm when it goes stale: it means rings are no longer reaching the broker.
+* **HBFILE** = /tmp/mqtt_tx_alive
+   File touched each time a heartbeat gets out; TcpDump2Mqtt restarts the publishing pipe when it is more than 5 minutes old.
 * **GATEWAYADDR** = 192.168.1.1
    Address of the router to which the video door entry unit is connected.
 
 ## StartMqttSend
 
 This script listens to the network traffic of the video door entry unit (commands from the app, from the internal unit, from the external unit), filters the packets and extracts the commands, sending them to the MQTT broker through the topic defined in the DUMPTOPIC variable of the main script TcpDump2Mqtt.
+
+Every command is sent by its own `mosquitto_pub` (QoS 1), retried for up to 2 minutes if the broker cannot be reached, then dropped and written to the system log. It used to be a single long-lived `mosquitto_pub -l`, but the mosquitto 1.4.14 client on the 300X does not survive a broker restart: it reconnects, sends one more command and then hangs for ever with its connection still open — the broker sees a healthy client, the old TcpDump2Mqtt saw `tcpdump` running, and every later ring was silently lost until the unit was rebooted. The receiving side was not affected.
 
 ## StartMqttReceive
 

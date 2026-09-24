@@ -1,4 +1,47 @@
-#!/bin/sh
+#!/bin/bash
+# Every OpenWebNet frame seen on lo goes to ${DUMPTOPIC} -- ONE mosquitto_pub PER FRAME.
+# bash, not sh: `read -t` below is a bashism (the 300X's /bin/sh is bash too).
+#
+# This used to be a single long-lived `mosquitto_pub -l`. The mosquitto 1.4.14 client on the
+# 300X never recovers from a broker restart (e.g. the broker host rebooting): it reconnects,
+# sends ONE more frame, then hangs for ever in pthread_join with its connection still
+# ESTABLISHED -- so the broker and TcpDump2Mqtt's pgrep both see a healthy client while
+# every later ring is lost.
+# A process per frame has no connection to go stale. -q 1 waits for the broker's PUBACK, so
+# a failure is known and retried; frames arriving meanwhile wait in the pipe, in order.
+#
+# The same loop publishes a retained heartbeat (epoch seconds) on ${HBTOPIC} once a minute
+# and touches ${HBFILE} when it gets out: the heartbeat comes from the path a ring takes.
 
-/usr/sbin/tcpdump -i lo -U not udp and not icmp and not port 5007 and not port 5060 and not port 20000 and not dst port 30006 -A -q -l 2>&1 | /usr/bin/python3 /home/root/filter.py | /usr/bin/mosquitto_pub -l -h ${BROKERADDR} -t ${DUMPTOPIC}
+RETRY_FOR=120        # seconds to keep retrying one frame: long enough for the broker host to reboot
+HB_EVERY=60
 
+pub() {   # pub <topic> <payload> [-r]
+  /usr/bin/timeout 10 /usr/bin/mosquitto_pub -q 1 -h "${BROKERADDR}" -t "$1" -m "$2" $3
+}
+
+/usr/sbin/tcpdump -i lo -U not udp and not icmp and not port 5007 and not port 5060 and not port 20000 and not dst port 30006 -A -q -l 2>&1 \
+| /usr/bin/python3 /home/root/filter.py \
+| {
+  last_hb=0
+  while :; do
+    IFS= read -r -t 30 FRAME; rc=$?
+    if [ $rc -eq 0 ]; then
+      deadline=$(( $(date +%s) + RETRY_FOR ))
+      until pub "${DUMPTOPIC}" "$FRAME"; do
+        if [ "$(date +%s)" -ge $deadline ]; then
+          /usr/bin/logger -t TcpDump2Mqtt "broker unreachable for ${RETRY_FOR}s, frame dropped: $FRAME"
+          break
+        fi
+        /bin/sleep 5
+      done
+    elif [ $rc -le 128 ]; then
+      exit 0        # EOF: tcpdump or filter.py died; TcpDump2Mqtt restarts the whole pipe
+    fi
+    now=$(date +%s)
+    if [ $((now - last_hb)) -ge $HB_EVERY ] && pub "${HBTOPIC}" "$now" -r; then
+      last_hb=$now
+      /bin/touch "${HBFILE}"
+    fi
+  done
+}
